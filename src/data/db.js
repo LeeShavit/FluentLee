@@ -1,12 +1,19 @@
 import { generateClient } from 'aws-amplify/data'
 
-let client
-try {
-  client = generateClient()
-} catch {
-  client = null
-  console.log('Amplify client not available — falling back to localStorage')
+let _client = null
+
+function getClient() {
+  if (!_client) {
+    _client = generateClient()
+  }
+  return _client
 }
+
+const client = new Proxy({}, {
+  get(_, prop) {
+    return getClient()[prop]
+  }
+})
 
 // ============================================================================
 // SEED TAGS
