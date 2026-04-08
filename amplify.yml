@@ -4,6 +4,7 @@ frontend:
     preBuild:
       commands:
         - nvm use 22
+        - rm -rf node_modules
         - npm install
     build:
       commands:
@@ -15,4 +16,3 @@ frontend:
   cache:
     paths:
       - .npm/**/*
-      - node_modules/**/*
