@@ -4,7 +4,7 @@ frontend:
     preBuild:
       commands:
         - nvm use 22
-        - rm -rf node_modules
+        - rm -rf node_modules package-lock.json
         - npm install
     build:
       commands:
