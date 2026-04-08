@@ -1,25 +1,11 @@
-import { v4 as uuidv4 } from 'uuid'
-import { PROFICIENCY } from '../utils/proficiency.js'
+import { generateClient } from 'aws-amplify/data'
 
-// Storage keys
-const GROUPS_KEY = 'flashcards_groups'
-const CARDS_KEY = 'flashcards_cards'
-const TAGS_KEY = 'flashcards_tags'
-
-// ============================================================================
-// Helper functions for localStorage
-// ============================================================================
-
-function load(key) {
-  try {
-    return JSON.parse(localStorage.getItem(key)) || []
-  } catch {
-    return []
-  }
-}
-
-function save(key, data) {
-  localStorage.setItem(key, JSON.stringify(data))
+let client
+try {
+  client = generateClient()
+} catch {
+  client = null
+  console.log('Amplify client not available — falling back to localStorage')
 }
 
 // ============================================================================
@@ -36,308 +22,267 @@ const SEED_TAGS = [
   'Conversation',
 ]
 
-function seedTags() {
-  const existing = load(TAGS_KEY)
+let seedPromise = null
+
+async function seedTags() {
+  if (!client) return
+  const { data: existing } = await client.models.Tag.list({ limit: 1000 })
   const existingNames = new Set(existing.map(t => t.name.toLowerCase()))
-  let updated = false
 
   for (const name of SEED_TAGS) {
     if (!existingNames.has(name.toLowerCase())) {
-      existing.push({ id: uuidv4(), name })
-      updated = true
+      await client.models.Tag.create({ name })
+    }
+  }
+}
+
+// Run seed once on first import
+seedPromise = seedTags().catch(() => {})
+
+// Helper: wait for seed to finish before tag operations
+async function ensureSeeded() {
+  if (seedPromise) await seedPromise
+}
+
+// ============================================================================
+// Helper: get tag IDs for a card via CardTag join table
+// ============================================================================
+
+async function getTagIdsForCard(cardId) {
+  const { data: cardTags } = await client.models.CardTag.list({
+    filter: { cardId: { eq: cardId } },
+    limit: 1000,
+  })
+  return cardTags.map(ct => ct.tagId)
+}
+
+async function setTagsForCard(cardId, tagIds) {
+  // Get existing card-tag associations
+  const { data: existing } = await client.models.CardTag.list({
+    filter: { cardId: { eq: cardId } },
+    limit: 1000,
+  })
+  const existingTagIds = new Set(existing.map(ct => ct.tagId))
+  const newTagIds = new Set(tagIds)
+
+  // Delete removed tags
+  for (const ct of existing) {
+    if (!newTagIds.has(ct.tagId)) {
+      await client.models.CardTag.delete({ id: ct.id })
     }
   }
 
-  if (updated) save(TAGS_KEY, existing)
+  // Add new tags
+  for (const tagId of tagIds) {
+    if (!existingTagIds.has(tagId)) {
+      await client.models.CardTag.create({ cardId, tagId })
+    }
+  }
 }
 
-seedTags()
+// Helper: enrich card with tags array (to match old localStorage format)
+async function enrichCard(card) {
+  const tags = await getTagIdsForCard(card.id)
+  return { ...card, tags }
+}
 
 // ============================================================================
 // GROUPS
 // ============================================================================
 
-/**
- * Get all groups
- * @returns {Promise<Array>}
- */
 export async function getGroups() {
-  return load(GROUPS_KEY)
+  const { data } = await client.models.Group.list({ limit: 1000 })
+  return data.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
 }
 
-/**
- * Get a single group by ID
- * @param {string} id
- * @returns {Promise<Object|null>}
- */
 export async function getGroup(id) {
-  const groups = load(GROUPS_KEY)
-  return groups.find(g => g.id === id) || null
+  const { data } = await client.models.Group.get({ id })
+  return data
 }
 
-/**
- * Create a new group
- * @param {string} name
- * @returns {Promise<Object>} Created group
- */
 export async function createGroup(name) {
-  const groups = load(GROUPS_KEY)
-  const group = {
-    id: uuidv4(),
-    name,
-    createdAt: new Date().toISOString(),
-  }
-  groups.push(group)
-  save(GROUPS_KEY, groups)
-  return group
+  const { data } = await client.models.Group.create({ name })
+  return data
 }
 
-/**
- * Update a group
- * @param {string} id
- * @param {Object} updates - { name, ... }
- * @returns {Promise<Object>} Updated group
- */
 export async function updateGroup(id, updates) {
-  const groups = load(GROUPS_KEY)
-  const group = groups.find(g => g.id === id)
-  if (!group) throw new Error(`Group ${id} not found`)
-
-  Object.assign(group, updates)
-  save(GROUPS_KEY, groups)
-  return group
+  const { data } = await client.models.Group.update({ id, ...updates })
+  return data
 }
 
-/**
- * Delete a group and all its cards
- * @param {string} id
- * @returns {Promise<void>}
- */
 export async function deleteGroup(id) {
-  let groups = load(GROUPS_KEY)
-  let cards = load(CARDS_KEY)
-
-  groups = groups.filter(g => g.id !== id)
-  cards = cards.filter(c => c.groupId !== id)
-
-  save(GROUPS_KEY, groups)
-  save(CARDS_KEY, cards)
+  // Delete all cards in the group (and their card-tag associations)
+  const { data: cards } = await client.models.Card.list({
+    filter: { groupId: { eq: id } },
+    limit: 10000,
+  })
+  for (const card of cards) {
+    // Delete card-tag associations
+    const { data: cardTags } = await client.models.CardTag.list({
+      filter: { cardId: { eq: card.id } },
+      limit: 1000,
+    })
+    for (const ct of cardTags) {
+      await client.models.CardTag.delete({ id: ct.id })
+    }
+    await client.models.Card.delete({ id: card.id })
+  }
+  await client.models.Group.delete({ id })
 }
 
 // ============================================================================
 // CARDS
 // ============================================================================
 
-/**
- * Get filtered cards
- * @param {Object} filters
- *   - groupId {string} - Filter by group
- *   - tagIds {Array<string>} - Filter by tags (card must have ALL)
- *   - proficiency {string} - Filter by proficiency level
- *   - search {string} - Search in word and meaning (case-insensitive)
- * @returns {Promise<Array>}
- */
 export async function getCards(filters = {}) {
   const { groupId, tagIds, proficiency, search } = filters
-  let cards = load(CARDS_KEY)
 
-  // Filter by groupId
-  if (groupId) {
-    cards = cards.filter(c => c.groupId === groupId)
-  }
+  // Build Amplify filter
+  const filter = {}
+  if (groupId) filter.groupId = { eq: groupId }
+  if (proficiency) filter.proficiency = { eq: proficiency }
 
-  // Filter by proficiency
-  if (proficiency) {
-    cards = cards.filter(c => c.proficiency === proficiency)
-  }
+  const { data: cards } = await client.models.Card.list({
+    filter: Object.keys(filter).length > 0 ? filter : undefined,
+    limit: 10000,
+  })
 
-  // Filter by tagIds (card must have all specified tags)
+  // Enrich all cards with their tag IDs
+  let enriched = await Promise.all(cards.map(enrichCard))
+
+  // Client-side filter by tagIds (card must have ALL specified tags)
   if (tagIds && tagIds.length > 0) {
-    cards = cards.filter(c =>
+    enriched = enriched.filter(c =>
       tagIds.every(tagId => c.tags.includes(tagId))
     )
   }
 
-  // Filter by search (case-insensitive, searches word and meaning)
+  // Client-side search filter
   if (search) {
     const searchLower = search.toLowerCase()
-    cards = cards.filter(c =>
+    enriched = enriched.filter(c =>
       c.word.toLowerCase().includes(searchLower) ||
       c.meaning.toLowerCase().includes(searchLower)
     )
   }
 
-  return cards
+  return enriched.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
 }
 
-/**
- * Get a single card by ID
- * @param {string} id
- * @returns {Promise<Object|null>}
- */
 export async function getCard(id) {
-  const cards = load(CARDS_KEY)
-  return cards.find(c => c.id === id) || null
+  const { data } = await client.models.Card.get({ id })
+  if (!data) return null
+  return enrichCard(data)
 }
 
-/**
- * Create a new card
- * @param {Object} cardData
- *   - groupId {string}
- *   - word {string}
- *   - meaning {string}
- *   - example {string|null}
- *   - significance {number} default 3
- *   - proficiency {string} default 'NEW'
- *   - tags {Array<string>} default []
- * @returns {Promise<Object>} Created card
- */
 export async function createCard(cardData) {
-  const cards = load(CARDS_KEY)
-
-  const card = {
-    id: uuidv4(),
+  const { data } = await client.models.Card.create({
     groupId: cardData.groupId,
     word: cardData.word,
     meaning: cardData.meaning,
     example: cardData.example || null,
     significance: cardData.significance || 3,
-    proficiency: cardData.proficiency || PROFICIENCY.NEW,
-    tags: cardData.tags || [],
-    createdAt: new Date().toISOString(),
+    proficiency: cardData.proficiency || 'NEW',
+  })
+
+  // Create card-tag associations
+  if (cardData.tags && cardData.tags.length > 0) {
+    await setTagsForCard(data.id, cardData.tags)
   }
 
-  cards.push(card)
-  save(CARDS_KEY, cards)
-  return card
+  return enrichCard(data)
 }
 
-/**
- * Update a card
- * @param {string} id
- * @param {Object} updates - Partial card object
- * @returns {Promise<Object>} Updated card
- */
 export async function updateCard(id, updates) {
-  const cards = load(CARDS_KEY)
-  const card = cards.find(c => c.id === id)
-  if (!card) throw new Error(`Card ${id} not found`)
+  const cardUpdate = { id }
+  if (updates.groupId !== undefined) cardUpdate.groupId = updates.groupId
+  if (updates.word !== undefined) cardUpdate.word = updates.word
+  if (updates.meaning !== undefined) cardUpdate.meaning = updates.meaning
+  if (updates.example !== undefined) cardUpdate.example = updates.example
+  if (updates.significance !== undefined) cardUpdate.significance = updates.significance
+  if (updates.proficiency !== undefined) cardUpdate.proficiency = updates.proficiency
 
-  Object.assign(card, updates)
-  save(CARDS_KEY, cards)
-  return card
+  const { data } = await client.models.Card.update(cardUpdate)
+
+  // Update card-tag associations if tags are provided
+  if (updates.tags !== undefined) {
+    await setTagsForCard(id, updates.tags)
+  }
+
+  return enrichCard(data)
 }
 
-/**
- * Delete a card
- * @param {string} id
- * @returns {Promise<void>}
- */
 export async function deleteCard(id) {
-  let cards = load(CARDS_KEY)
-  cards = cards.filter(c => c.id !== id)
-  save(CARDS_KEY, cards)
+  // Delete card-tag associations first
+  const { data: cardTags } = await client.models.CardTag.list({
+    filter: { cardId: { eq: id } },
+    limit: 1000,
+  })
+  for (const ct of cardTags) {
+    await client.models.CardTag.delete({ id: ct.id })
+  }
+  await client.models.Card.delete({ id })
 }
 
-/**
- * Bulk create cards
- * @param {string} groupId
- * @param {Array<{word, meaning}>} cards - Array of card data
- * @param {Array<string>} tagIds - Tags to apply to all cards
- * @returns {Promise<Array>} Created cards
- */
 export async function bulkCreateCards(groupId, cards, tagIds = []) {
-  const existing = load(CARDS_KEY)
   const created = []
-
   for (const cardData of cards) {
-    const card = {
-      id: uuidv4(),
+    const { data } = await client.models.Card.create({
       groupId,
       word: cardData.word,
       meaning: cardData.meaning,
       example: null,
       significance: 3,
-      proficiency: PROFICIENCY.NEW,
-      tags: tagIds,
-      createdAt: new Date().toISOString(),
-    }
-    existing.push(card)
-    created.push(card)
-  }
+      proficiency: 'NEW',
+    })
 
-  save(CARDS_KEY, existing)
+    if (tagIds.length > 0) {
+      for (const tagId of tagIds) {
+        await client.models.CardTag.create({ cardId: data.id, tagId })
+      }
+    }
+
+    created.push({ ...data, tags: tagIds })
+  }
   return created
 }
 
-/**
- * Update card proficiency
- * @param {string} id
- * @param {string} proficiency
- * @returns {Promise<Object>} Updated card
- */
 export async function updateCardProficiency(id, proficiency) {
-  return updateCard(id, { proficiency })
+  const { data } = await client.models.Card.update({ id, proficiency })
+  return data
 }
 
 // ============================================================================
 // TAGS
 // ============================================================================
 
-/**
- * Get all tags
- * @returns {Promise<Array>}
- */
 export async function getTags() {
-  return load(TAGS_KEY)
+  await ensureSeeded()
+  const { data } = await client.models.Tag.list({ limit: 1000 })
+  return data.sort((a, b) => a.name.localeCompare(b.name))
 }
 
-/**
- * Create a new tag
- * @param {string} name
- * @returns {Promise<Object>} Created tag
- */
 export async function createTag(name) {
-  const tags = load(TAGS_KEY)
-
-  const tag = {
-    id: uuidv4(),
-    name,
-  }
-
-  tags.push(tag)
-  save(TAGS_KEY, tags)
-  return tag
+  const { data } = await client.models.Tag.create({ name })
+  return data
 }
 
-/**
- * Delete a tag and remove it from all cards
- * @param {string} id
- * @returns {Promise<void>}
- */
 export async function deleteTag(id) {
-  let tags = load(TAGS_KEY)
-  let cards = load(CARDS_KEY)
-
-  tags = tags.filter(t => t.id !== id)
-  cards = cards.map(c => ({
-    ...c,
-    tags: c.tags.filter(tagId => tagId !== id),
-  }))
-
-  save(TAGS_KEY, tags)
-  save(CARDS_KEY, cards)
+  // Delete all card-tag associations for this tag
+  const { data: cardTags } = await client.models.CardTag.list({
+    filter: { tagId: { eq: id } },
+    limit: 10000,
+  })
+  for (const ct of cardTags) {
+    await client.models.CardTag.delete({ id: ct.id })
+  }
+  await client.models.Tag.delete({ id })
 }
 
 // ============================================================================
 // STATS
 // ============================================================================
 
-/**
- * Get stats for a group
- * @param {string} groupId
- * @returns {Promise<Object>} { total, new, recognized, recalled, mastered }
- */
 export async function getGroupStats(groupId) {
   const cards = await getCards({ groupId })
 
@@ -350,7 +295,7 @@ export async function getGroupStats(groupId) {
   }
 
   for (const card of cards) {
-    const prof = card.proficiency.toLowerCase()
+    const prof = (card.proficiency || 'NEW').toLowerCase()
     if (prof === 'new') stats.new++
     else if (prof === 'recognized') stats.recognized++
     else if (prof === 'recalled') stats.recalled++
